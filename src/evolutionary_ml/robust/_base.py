@@ -50,6 +50,11 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
         >0 enables memetic local improvement (FAST-LTS style).
     prob_move : float, default=0.2
         Probability of applying the residual-window Move operator instead of the Hawkins point swap.
+    reweight : bool, default=True
+        Whether to perform a second-stage Reweighted Least Squares (RLS) fit.
+        RLS achieves 95% Gaussian asymptotic efficiency while preserving the 50% breakdown point.
+    init_method : {"random", "pca"}, default="random"
+        Initial subset selection method. "pca" uses robust principal directions to seed initial points.
     fit_intercept : bool, default=True
         Whether to calculate the intercept for this model.
     random_state : int, RandomState instance or None, default=None
@@ -62,6 +67,8 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
         max_iter: int = 1000,
         c_steps: int = 0,
         prob_move: float = 0.2,
+        reweight: bool = True,
+        init_method: Literal["random", "pca"] = "random",
         fit_intercept: bool = True,
         random_state: int | np.random.RandomState | None = None,
     ) -> None:
@@ -69,6 +76,8 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
         self.max_iter = max_iter
         self.c_steps = c_steps
         self.prob_move = prob_move
+        self.reweight = reweight
+        self.init_method = init_method
         self.fit_intercept = fit_intercept
         self.random_state = random_state
 
@@ -160,6 +169,8 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
             raise ValueError(f"c_steps must be >= 0, got {self.c_steps}")
         if not (0.0 <= self.prob_move <= 1.0):
             raise ValueError(f"prob_move must be in [0, 1], got {self.prob_move}")
+        if self.init_method not in ("random", "pca"):
+            raise ValueError(f"init_method must be 'random' or 'pca', got '{self.init_method}'")
 
         rng = check_random_state(self.random_state)
 
@@ -178,12 +189,24 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
             beta = _solve_elemental_subset(X_tilde, y)
             residuals = _compute_residuals(X_tilde, y, beta)
             crit, h_indices = self._compute_criterion(residuals, min(h, n_samples))
-            self._finalize(beta, residuals, crit, h_indices, n_samples)
+            self._finalize(beta, residuals, crit, h_indices, n_samples, X_tilde, y)
             self.n_iter_ = 0
             return self
 
         # 1. Initialize elemental subset of size p_params
-        active_indices = np.sort(rng.choice(n_samples, size=p_params, replace=False))
+        if self.init_method == "pca" and n_features > 0:
+            # Deterministic/PCA start: project centered X on leading principal direction
+            X_centered = X - np.median(X, axis=0)
+            try:
+                _, _, vt = np.linalg.svd(X_centered, full_matrices=False)
+                proj = np.abs(np.dot(X_centered, vt[0]))
+                order = np.argsort(proj)
+                active_indices = np.sort(order[:p_params])
+            except Exception:
+                active_indices = np.sort(rng.choice(n_samples, size=p_params, replace=False))
+        else:
+            active_indices = np.sort(rng.choice(n_samples, size=p_params, replace=False))
+
         beta = _solve_elemental_subset(X_tilde[active_indices], y[active_indices])
         residuals = _compute_residuals(X_tilde, y, beta)
         best_crit, best_h_indices = self._compute_criterion(residuals, h)
@@ -211,12 +234,10 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
             if use_move:
                 # Move operator: pick k in [p_params, n_samples]
                 k = rng.randint(p_params, n_samples + 1)
-                # Sort absolute residuals to find window of points with similar residuals
                 order = np.argsort(np.abs(residuals))
                 start = max(0, k - p_params)
                 candidate_indices = order[start : start + p_params]
                 if len(candidate_indices) < p_params:
-                    # Fallback to swap if window is too small
                     candidate_indices = active_indices.copy()
             else:
                 # Point swap: Hawkins (1993)
@@ -263,7 +284,7 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
                 residuals = candidate_residuals
 
         self.n_iter_ = self.max_iter
-        self._finalize(best_beta, best_residuals, best_crit, best_h_indices, n_samples)
+        self._finalize(best_beta, best_residuals, best_crit, best_h_indices, n_samples, X_tilde, y)
         return self
 
     def _finalize(
@@ -273,20 +294,45 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
         best_crit: float,
         best_h_indices: np.ndarray,
         n_samples: int,
+        X_tilde: np.ndarray,
+        y: np.ndarray,
     ) -> None:
-        """Extract coefficients, intercept, residuals, and inlier mask."""
+        """Extract coefficients, intercept, residuals, and inlier mask, with optional RLS."""
+        final_beta = beta
+        final_residuals = residuals
+        final_inliers = best_h_indices
+
+        # Stage 2: Reweighted Least Squares (RLS)
+        if self.reweight and n_samples > len(beta):
+            med_r = np.median(residuals)
+            mad_r = float(np.median(np.abs(residuals - med_r)))
+            sigma_0 = 1.4826 * mad_r if mad_r > 1e-12 else float(np.std(residuals))
+
+            if sigma_0 > 1e-12:
+                cutoff = 2.5 * sigma_0
+                inlier_candidates = np.where(np.abs(residuals) <= cutoff)[0]
+                if len(inlier_candidates) >= len(beta):
+                    try:
+                        beta_rw = _solve_elemental_subset(X_tilde[inlier_candidates], y[inlier_candidates])
+                        residuals_rw = _compute_residuals(X_tilde, y, beta_rw)
+                        final_beta = beta_rw
+                        final_residuals = residuals_rw
+                        final_inliers = inlier_candidates
+                    except Exception:
+                        pass
+
         if self.fit_intercept:
-            self.intercept_ = float(beta[0])
-            self.coef_ = np.asarray(beta[1:], dtype=np.float64)
+            self.intercept_ = float(final_beta[0])
+            self.coef_ = np.asarray(final_beta[1:], dtype=np.float64)
         else:
             self.intercept_ = 0.0
-            self.coef_ = np.asarray(beta, dtype=np.float64)
+            self.coef_ = np.asarray(final_beta, dtype=np.float64)
 
-        self.residuals_ = residuals
+        self.residuals_ = final_residuals
         self.best_criterion_ = float(best_crit)
 
         self.inlier_mask_ = np.zeros(n_samples, dtype=bool)
-        self.inlier_mask_[best_h_indices] = True
+        self.inlier_mask_[final_inliers] = True
 
     def predict(self, X: Any) -> np.ndarray:
         """Predict using the robust linear model.

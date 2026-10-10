@@ -43,25 +43,28 @@ y_stackloss = STACKLOSS_DATA[:, 3]
 def test_stackloss_lts():
     """Test EvolutionaryLTSRegressor on stackloss data."""
     # Classical outliers are 1, 3, 4, 21 (1-based), i.e., 0, 2, 3, 20 (0-based)
-    model = EvolutionaryLTSRegressor(
+    # Pure trimming (reweight=False): exactly h=13 inliers
+    model_pure = EvolutionaryLTSRegressor(
         max_iter=1500,
         c_steps=2,
+        reweight=False,
         random_state=42,
     )
-    model.fit(X_stackloss, y_stackloss)
+    model_pure.fit(X_stackloss, y_stackloss)
+    assert np.sum(model_pure.inlier_mask_) == 13
+    assert model_pure.best_criterion_ < 10.0
 
-    assert hasattr(model, "coef_")
-    assert hasattr(model, "intercept_")
-    assert hasattr(model, "inlier_mask_")
-    assert model.coef_.shape == (3,)
-    assert model.inlier_mask_.shape == (21,)
-
-    # The inliers should exclude known severe outliers (e.g. 0, 2, 3, 20)
-    # Check that inlier count equals h = floor((21 + 4 + 1) / 2) = 13
-    assert np.sum(model.inlier_mask_) == 13
-
-    # Best criterion should be close to paper / robustbase LTS criterion (~2.9 - 5.0)
-    assert model.best_criterion_ < 10.0
+    # Reweighted (reweight=True, default): adaptive inlier recovery
+    model_rw = EvolutionaryLTSRegressor(
+        max_iter=1500,
+        c_steps=2,
+        reweight=True,
+        random_state=42,
+    )
+    model_rw.fit(X_stackloss, y_stackloss)
+    assert np.sum(model_rw.inlier_mask_) >= 15
+    assert hasattr(model_rw, "coef_")
+    assert hasattr(model_rw, "intercept_")
 
 
 def test_stackloss_lms():

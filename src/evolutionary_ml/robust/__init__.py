@@ -33,6 +33,10 @@ class EvolutionaryRobustRegressor(BaseEvolutionaryRobustRegressor):
         Number of concentration steps (C-steps) per evaluation.
     prob_move : float, default=0.2
         Probability of applying the residual-window Move operator.
+    reweight : bool, default=True
+        Whether to perform a second-stage Reweighted Least Squares (RLS) fit.
+    init_method : {"random", "pca"}, default="random"
+        Initial subset selection method.
     fit_intercept : bool, default=True
         Whether to calculate the intercept for this model.
     random_state : int, RandomState instance or None, default=None
@@ -46,6 +50,8 @@ class EvolutionaryRobustRegressor(BaseEvolutionaryRobustRegressor):
         max_iter: int = 1000,
         c_steps: int = 0,
         prob_move: float = 0.2,
+        reweight: bool = True,
+        init_method: Literal["random", "pca"] = "random",
         fit_intercept: bool = True,
         random_state: int | np.random.RandomState | None = None,
     ) -> None:
@@ -54,6 +60,8 @@ class EvolutionaryRobustRegressor(BaseEvolutionaryRobustRegressor):
             max_iter=max_iter,
             c_steps=c_steps,
             prob_move=prob_move,
+            reweight=reweight,
+            init_method=init_method,
             fit_intercept=fit_intercept,
             random_state=random_state,
         )
