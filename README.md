@@ -67,6 +67,28 @@ print(f"Inliers detected: {np.sum(reg.inlier_mask_)} / 100")
 
 ---
 
+## Benchmark Datasets
+
+The package bundles canonical benchmark datasets from the robust statistics literature:
+
+```python
+from evolutionary_ml.datasets import (
+    load_hbk,         # Hawkins-Bradu-Kass artificial data (n=75, p=3, 14 leverage points)
+    load_stars,       # CYG OB1 star cluster (n=47, p=1, 4 giant star outliers)
+    load_stackloss,   # Brownlee stack loss plant data (n=21, p=3, 4 outliers)
+    load_salinity,    # Salinity Pamlico sound data (n=28, p=3, 4 outliers)
+    load_coleman,     # Coleman school performance data (n=20, p=5, 3 outliers)
+    load_wood,        # Wood specific gravity data (n=20, p=5, 4 outliers)
+)
+
+data = load_hbk()
+print(data.feature_names)       # ['X1', 'X2', 'X3']
+print(data.outlier_indices)     # [0, 1, ..., 13]
+print(data.bad_leverage_indices)  # [0, ..., 9]
+```
+
+---
+
 ## Architecture & Portfolio Context
 
 In the wider ML ecosystem within this repository:
