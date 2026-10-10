@@ -132,6 +132,15 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
         RLS achieves 95% Gaussian asymptotic efficiency while preserving the 50% breakdown point.
     init_method : {"random", "pca"}, default="random"
         Initial subset selection method. "pca" uses robust principal directions to seed initial points.
+    subsample_threshold : int or None, default=None
+        Threshold on the number of samples to trigger Big Data nested subsampling / partitioning.
+        If n_samples > subsample_threshold, the dataset is partitioned into sub-blocks
+        for accelerated evolutionary candidate search, followed by global concentration and
+        refinement on the full dataset. If None, full dataset is evaluated directly.
+    subsample_size : int, default=500
+        Target size of each sub-block partition when nested subsampling is activated.
+    n_subsamples : int, default=5
+        Maximum number of disjoint partitions to divide large datasets into.
     fit_intercept : bool, default=True
         Whether to calculate the intercept for this model.
     random_state : int, RandomState instance or None, default=None
@@ -150,6 +159,9 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
         prob_move: float = 0.2,
         reweight: bool = True,
         init_method: Literal["random", "pca"] = "random",
+        subsample_threshold: int | None = None,
+        subsample_size: int = 500,
+        n_subsamples: int = 5,
         fit_intercept: bool = True,
         random_state: int | np.random.RandomState | None = None,
     ) -> None:
@@ -163,6 +175,9 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
         self.prob_move = prob_move
         self.reweight = reweight
         self.init_method = init_method
+        self.subsample_threshold = subsample_threshold
+        self.subsample_size = subsample_size
+        self.n_subsamples = n_subsamples
         self.fit_intercept = fit_intercept
         self.random_state = random_state
 
@@ -303,6 +318,14 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
             raise ValueError(
                 f"init_method must be 'random' or 'pca', got '{self.init_method}'"
             )
+        if self.subsample_threshold is not None and self.subsample_threshold < 1:
+            raise ValueError(
+                f"subsample_threshold must be >= 1, got {self.subsample_threshold}"
+            )
+        if self.subsample_size < 1:
+            raise ValueError(f"subsample_size must be >= 1, got {self.subsample_size}")
+        if self.n_subsamples < 1:
+            raise ValueError(f"n_subsamples must be >= 1, got {self.n_subsamples}")
 
         rng = check_random_state(self.random_state)
 
@@ -325,26 +348,127 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
             self.n_iter_ = 0
             return self
 
+        # Big Data nested subsampling / partitioning
+        if self.subsample_threshold is not None and n_samples > self.subsample_threshold:
+            k_blocks = min(self.n_subsamples, max(2, n_samples // self.subsample_size))
+            shuffled_indices = rng.permutation(n_samples)
+            partitions = np.array_split(shuffled_indices, k_blocks)
+
+            pooled_betas: list[np.ndarray] = []
+            iter_per_block = max(10, self.max_iter // k_blocks)
+
+            for part in partitions:
+                if len(part) <= p_params:
+                    continue
+                X_part = X_tilde[part]
+                y_part = y[part]
+                X_raw_part = X[part] if n_features > 0 else None
+                n_part = len(part)
+                h_part = self._resolve_h(n_part, p_params)
+
+                sub_pop, _ = self._run_evolutionary_search(
+                    X_part, y_part, h_part, p_params, n_part, iter_per_block, rng, X_raw_part
+                )
+                elite_count = max(2, self.population_size // k_blocks)
+                for ind in sub_pop[:elite_count]:
+                    pooled_betas.append(ind.beta)
+
+            # Optional PCA candidate on full sample
+            if self.init_method == "pca" and n_features > 0:
+                X_centered = X - np.median(X, axis=0)
+                try:
+                    _, _, vt = np.linalg.svd(X_centered, full_matrices=False)
+                    proj = np.abs(np.dot(X_centered, vt[0]))
+                    order = np.argsort(proj)
+                    pca_subset = np.sort(order[:p_params])
+                    pooled_betas.append(
+                        _solve_elemental_subset(X_tilde[pca_subset], y[pca_subset])
+                    )
+                except Exception:
+                    pass
+
+            # Full dataset refinement: evaluate pooled candidates on full dataset with C-steps
+            candidates_on_full: list[_Individual] = []
+            c_steps_to_apply = max(2, self.c_steps)
+            for beta_cand in pooled_betas:
+                res_full = _compute_residuals(X_tilde, y, beta_cand)
+                crit_full, h_ind_full = self._compute_criterion(res_full, h)
+
+                beta_curr = beta_cand
+                crit_curr = crit_full
+                res_curr = res_full
+                h_ind_curr = h_ind_full
+                for _ in range(c_steps_to_apply):
+                    beta_c, res_c, crit_c, h_c = self._c_step(
+                        X_tilde, y, h_ind_curr, h
+                    )
+                    if crit_c <= crit_curr:
+                        beta_curr, res_curr, crit_curr, h_ind_curr = beta_c, res_c, crit_c, h_c
+                    else:
+                        break
+                candidates_on_full.append(
+                    _Individual(
+                        subset=np.arange(p_params),
+                        beta=beta_curr,
+                        residuals=res_curr,
+                        crit=crit_curr,
+                        h_indices=h_ind_curr,
+                    )
+                )
+
+            candidates_on_full.sort(key=lambda ind: ind.crit)
+            best_ind = candidates_on_full[0]
+            self.n_iter_ = iter_per_block
+        else:
+            # Standard full dataset evolutionary search
+            population, actual_iterations = self._run_evolutionary_search(
+                X_tilde, y, h, p_params, n_samples, self.max_iter, rng, X
+            )
+            best_ind = population[0]
+            self.n_iter_ = actual_iterations
+
+        self._finalize(
+            best_ind.beta,
+            best_ind.residuals,
+            best_ind.crit,
+            best_ind.h_indices,
+            n_samples,
+            X_tilde,
+            y,
+        )
+        return self
+
+    def _run_evolutionary_search(
+        self,
+        X_tilde: np.ndarray,
+        y: np.ndarray,
+        h: int,
+        p_params: int,
+        n_samples: int,
+        max_iter: int,
+        rng: np.random.RandomState,
+        X_raw: np.ndarray | None = None,
+    ) -> tuple[list[_Individual], int]:
+        """Run (mu + lambda) evolutionary search on a given design matrix."""
+        n_features = X_tilde.shape[1] - (1 if self.fit_intercept else 0)
+
         # 1. Initialize population of size mu = population_size
         population: list[_Individual] = []
         for i in range(self.population_size):
-            if i == 0 and self.init_method == "pca" and n_features > 0:
-                X_centered = X - np.median(X, axis=0)
+            if i == 0 and self.init_method == "pca" and n_features > 0 and X_raw is not None:
+                X_centered = X_raw - np.median(X_raw, axis=0)
                 try:
                     _, _, vt = np.linalg.svd(X_centered, full_matrices=False)
                     proj = np.abs(np.dot(X_centered, vt[0]))
                     order = np.argsort(proj)
                     subset = np.sort(order[:p_params])
                 except Exception:
-                    subset = np.sort(
-                        rng.choice(n_samples, size=p_params, replace=False)
-                    )
+                    subset = np.sort(rng.choice(n_samples, size=p_params, replace=False))
             else:
                 subset = np.sort(rng.choice(n_samples, size=p_params, replace=False))
 
             ind = self._evaluate_candidate(subset, X_tilde, y, h)
             if ind is None:
-                # Fallback to random subset if singular
                 subset = np.sort(rng.choice(n_samples, size=p_params, replace=False))
                 ind = self._evaluate_candidate(subset, X_tilde, y, h)
             if ind is not None:
@@ -354,8 +478,11 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
         if len(population) == 0:
             subset = np.arange(p_params)
             ind = self._evaluate_candidate(subset, X_tilde, y, h)
-            assert ind is not None
-            population.append(ind)
+            if ind is not None:
+                population.append(ind)
+
+        if len(population) == 0:
+            raise ValueError("Failed to initialize any valid candidate subset.")
 
         # Sort population by criterion ascending
         population.sort(key=lambda ind: ind.crit)
@@ -365,7 +492,7 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
         generations_without_improvement = 0
         actual_iterations = 0
 
-        for iteration in range(1, self.max_iter + 1):
+        for iteration in range(1, max_iter + 1):
             actual_iterations = iteration
             offspring_list: list[_Individual] = []
 
@@ -415,17 +542,7 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
             ):
                 break
 
-        self.n_iter_ = actual_iterations
-        self._finalize(
-            best_ind.beta,
-            best_ind.residuals,
-            best_ind.crit,
-            best_ind.h_indices,
-            n_samples,
-            X_tilde,
-            y,
-        )
-        return self
+        return population, actual_iterations
 
     def _finalize(
         self,

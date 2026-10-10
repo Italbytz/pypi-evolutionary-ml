@@ -57,6 +57,9 @@ class EvolutionaryLMSRegressor(BaseEvolutionaryRobustRegressor):
         prob_move: float = 0.2,
         reweight: bool = True,
         init_method: Literal["random", "pca"] = "random",
+        subsample_threshold: int | None = None,
+        subsample_size: int = 500,
+        n_subsamples: int = 5,
         fit_intercept: bool = True,
         random_state: int | np.random.RandomState | None = None,
     ) -> None:
@@ -71,6 +74,9 @@ class EvolutionaryLMSRegressor(BaseEvolutionaryRobustRegressor):
             prob_move=prob_move,
             reweight=reweight,
             init_method=init_method,
+            subsample_threshold=subsample_threshold,
+            subsample_size=subsample_size,
+            n_subsamples=n_subsamples,
             fit_intercept=fit_intercept,
             random_state=random_state,
         )

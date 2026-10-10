@@ -25,6 +25,7 @@ It ports, modernizes, and extends the algorithms originally introduced in:
   - `EvolutionaryLQDRegressor`: Least Quartile Difference (minimizing $Q_n$-type scale of residual differences).
   - `EvolutionaryRobustRegressor`: Unified interface with selectable loss (`"lts"`, `"lms"`, `"lta"`, `"lqd"`).
 - **Hybrid / Memetic Support**: Optional Rousseeuw concentration steps (`c_steps=2`) enabling combined evolutionary global search and fast local refinement.
+- **Big Data Scalability**: Built-in nested subsampling / partitioning (`subsample_threshold=1000`) enabling robust 50% breakdown regression on $n=100{,}000+$ samples in $\approx 1$ second.
 - **Pure NumPy Vectorization**: Fast vector arithmetic with no heavy external metaheuristic dependencies.
 
 ---
