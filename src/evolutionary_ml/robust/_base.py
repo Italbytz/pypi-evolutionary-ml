@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin
@@ -32,6 +32,74 @@ def _solve_elemental_subset(X_subset: np.ndarray, y_subset: np.ndarray) -> np.nd
     return coef
 
 
+def _crossover_subsets(
+    parent_a: np.ndarray,
+    parent_b: np.ndarray,
+    p_params: int,
+    n_samples: int,
+    rng: np.random.RandomState,
+) -> np.ndarray:
+    """Perform uniform subset crossover between two parent elemental subsets."""
+    common = np.intersect1d(parent_a, parent_b)
+    disjoint = np.setdiff1d(np.union1d(parent_a, parent_b), common)
+
+    n_needed = p_params - len(common)
+    if n_needed <= 0:
+        return np.sort(common[:p_params])
+
+    if len(disjoint) >= n_needed:
+        selected = rng.choice(disjoint, size=n_needed, replace=False)
+        child = np.concatenate([common, selected])
+    else:
+        used = np.union1d(parent_a, parent_b)
+        unused = np.setdiff1d(np.arange(n_samples), used)
+        if len(unused) > 0:
+            extra = rng.choice(
+                unused, size=min(n_needed - len(disjoint), len(unused)), replace=False
+            )
+            child = np.concatenate([common, disjoint, extra])
+        else:
+            child = np.union1d(parent_a, parent_b)
+
+    return np.sort(child[:p_params])
+
+
+def _mutate_subset(
+    subset: np.ndarray,
+    residuals: np.ndarray,
+    p_params: int,
+    n_samples: int,
+    prob_move: float,
+    rng: np.random.RandomState,
+) -> np.ndarray:
+    """Mutate an elemental subset via either the Move operator or Hawkins swap."""
+    use_move = rng.uniform(0.0, 1.0) < prob_move
+    if use_move:
+        k = rng.randint(p_params, n_samples + 1)
+        order = np.argsort(np.abs(residuals))
+        start = max(0, k - p_params)
+        candidate = order[start : start + p_params]
+        if len(candidate) == p_params:
+            return np.sort(candidate)
+
+    # Hawkins point swap: replace 1 element
+    candidate = subset.copy()
+    inactive = np.setdiff1d(np.arange(n_samples), candidate)
+    if len(inactive) > 0:
+        out_idx = rng.randint(0, len(candidate))
+        in_elem = rng.choice(inactive)
+        candidate[out_idx] = in_elem
+    return np.sort(candidate)
+
+
+class _Individual(NamedTuple):
+    subset: np.ndarray
+    beta: np.ndarray
+    residuals: np.ndarray
+    crit: float
+    h_indices: np.ndarray
+
+
 class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
     """Abstract base class for evolutionary robust regression estimators.
 
@@ -44,9 +112,18 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
         If int, h = quantile.
     max_iter : int, default=1000
         Maximum number of evolutionary generations (iterations).
+    population_size : int, default=10
+        Number of parent individuals (mu) in the population.
+        Setting to 1 reproduces the classic (1+1)-EA of Nunkesser & Morell (2010).
+    n_offspring : int, default=10
+        Number of offspring (lambda) produced per generation.
+    crossover_rate : float, default=0.5
+        Probability of applying uniform subset crossover to pair parents.
+    n_iter_no_change : int or None, default=None
+        Early stopping: terminate if no improvement occurs for this number of generations.
     c_steps : int, default=0
         Number of concentration steps (C-steps) applied to refine solutions.
-        0 means pure (1+1)-evolutionary algorithm as in Nunkesser & Morell (2010).
+        0 means pure evolutionary algorithm.
         >0 enables memetic local improvement (FAST-LTS style).
     prob_move : float, default=0.2
         Probability of applying the residual-window Move operator instead of the Hawkins point swap.
@@ -65,6 +142,10 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
         self,
         quantile: int | float | None = None,
         max_iter: int = 1000,
+        population_size: int = 10,
+        n_offspring: int = 10,
+        crossover_rate: float = 0.5,
+        n_iter_no_change: int | None = None,
         c_steps: int = 0,
         prob_move: float = 0.2,
         reweight: bool = True,
@@ -74,6 +155,10 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
     ) -> None:
         self.quantile = quantile
         self.max_iter = max_iter
+        self.population_size = population_size
+        self.n_offspring = n_offspring
+        self.crossover_rate = crossover_rate
+        self.n_iter_no_change = n_iter_no_change
         self.c_steps = c_steps
         self.prob_move = prob_move
         self.reweight = reweight
@@ -142,6 +227,43 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
         crit_c, new_h_indices = self._compute_criterion(residuals_c, h)
         return beta_c, residuals_c, crit_c, new_h_indices
 
+    def _evaluate_candidate(
+        self,
+        subset: np.ndarray,
+        X_tilde: np.ndarray,
+        y: np.ndarray,
+        h: int,
+    ) -> _Individual | None:
+        """Evaluate an elemental subset candidate and apply optional C-steps."""
+        try:
+            beta = _solve_elemental_subset(X_tilde[subset], y[subset])
+        except Exception:
+            return None
+
+        residuals = _compute_residuals(X_tilde, y, beta)
+        crit, h_indices = self._compute_criterion(residuals, h)
+
+        if self.c_steps > 0:
+            for _ in range(self.c_steps):
+                beta_c, residuals_c, crit_c, new_h_indices = self._c_step(
+                    X_tilde, y, h_indices, h
+                )
+                if crit_c <= crit:
+                    beta, residuals, crit, h_indices = (
+                        beta_c,
+                        residuals_c,
+                        crit_c,
+                        new_h_indices,
+                    )
+
+        return _Individual(
+            subset=subset,
+            beta=beta,
+            residuals=residuals,
+            crit=crit,
+            h_indices=h_indices,
+        )
+
     def fit(self, X: Any, y: Any) -> BaseEvolutionaryRobustRegressor:
         """Fit the robust regression model using the evolutionary algorithm.
 
@@ -165,12 +287,22 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
 
         if self.max_iter < 1:
             raise ValueError(f"max_iter must be >= 1, got {self.max_iter}")
+        if self.population_size < 1:
+            raise ValueError(f"population_size must be >= 1, got {self.population_size}")
+        if self.n_offspring < 1:
+            raise ValueError(f"n_offspring must be >= 1, got {self.n_offspring}")
+        if not (0.0 <= self.crossover_rate <= 1.0):
+            raise ValueError(f"crossover_rate must be in [0, 1], got {self.crossover_rate}")
+        if self.n_iter_no_change is not None and self.n_iter_no_change < 1:
+            raise ValueError(f"n_iter_no_change must be >= 1, got {self.n_iter_no_change}")
         if self.c_steps < 0:
             raise ValueError(f"c_steps must be >= 0, got {self.c_steps}")
         if not (0.0 <= self.prob_move <= 1.0):
             raise ValueError(f"prob_move must be in [0, 1], got {self.prob_move}")
         if self.init_method not in ("random", "pca"):
-            raise ValueError(f"init_method must be 'random' or 'pca', got '{self.init_method}'")
+            raise ValueError(
+                f"init_method must be 'random' or 'pca', got '{self.init_method}'"
+            )
 
         rng = check_random_state(self.random_state)
 
@@ -193,98 +325,106 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
             self.n_iter_ = 0
             return self
 
-        # 1. Initialize elemental subset of size p_params
-        if self.init_method == "pca" and n_features > 0:
-            # Deterministic/PCA start: project centered X on leading principal direction
-            X_centered = X - np.median(X, axis=0)
-            try:
-                _, _, vt = np.linalg.svd(X_centered, full_matrices=False)
-                proj = np.abs(np.dot(X_centered, vt[0]))
-                order = np.argsort(proj)
-                active_indices = np.sort(order[:p_params])
-            except Exception:
-                active_indices = np.sort(rng.choice(n_samples, size=p_params, replace=False))
-        else:
-            active_indices = np.sort(rng.choice(n_samples, size=p_params, replace=False))
-
-        beta = _solve_elemental_subset(X_tilde[active_indices], y[active_indices])
-        residuals = _compute_residuals(X_tilde, y, beta)
-        best_crit, best_h_indices = self._compute_criterion(residuals, h)
-
-        if self.c_steps > 0:
-            for _ in range(self.c_steps):
-                beta_c, residuals_c, crit_c, new_h_indices = self._c_step(
-                    X_tilde, y, best_h_indices, h
-                )
-                if crit_c <= best_crit:
-                    beta, residuals, best_crit, best_h_indices = (
-                        beta_c,
-                        residuals_c,
-                        crit_c,
-                        new_h_indices,
+        # 1. Initialize population of size mu = population_size
+        population: list[_Individual] = []
+        for i in range(self.population_size):
+            if i == 0 and self.init_method == "pca" and n_features > 0:
+                X_centered = X - np.median(X, axis=0)
+                try:
+                    _, _, vt = np.linalg.svd(X_centered, full_matrices=False)
+                    proj = np.abs(np.dot(X_centered, vt[0]))
+                    order = np.argsort(proj)
+                    subset = np.sort(order[:p_params])
+                except Exception:
+                    subset = np.sort(
+                        rng.choice(n_samples, size=p_params, replace=False)
                     )
-
-        best_beta = beta.copy()
-        best_residuals = residuals.copy()
-
-        # 2. (1+1)-Evolutionary Algorithm
-        for iteration in range(1, self.max_iter + 1):
-            use_move = (rng.uniform(0.0, 1.0) < self.prob_move)
-
-            if use_move:
-                # Move operator: pick k in [p_params, n_samples]
-                k = rng.randint(p_params, n_samples + 1)
-                order = np.argsort(np.abs(residuals))
-                start = max(0, k - p_params)
-                candidate_indices = order[start : start + p_params]
-                if len(candidate_indices) < p_params:
-                    candidate_indices = active_indices.copy()
             else:
-                # Point swap: Hawkins (1993)
-                candidate_indices = active_indices.copy()
-                inactive = np.setdiff1d(np.arange(n_samples), candidate_indices)
-                if len(inactive) > 0:
-                    out_idx = rng.randint(0, p_params)
-                    in_elem = rng.choice(inactive)
-                    candidate_indices[out_idx] = in_elem
-                    candidate_indices = np.sort(candidate_indices)
+                subset = np.sort(rng.choice(n_samples, size=p_params, replace=False))
 
-            # Solve elemental candidate
-            try:
-                candidate_beta = _solve_elemental_subset(
-                    X_tilde[candidate_indices], y[candidate_indices]
-                )
-            except Exception:
-                continue
+            ind = self._evaluate_candidate(subset, X_tilde, y, h)
+            if ind is None:
+                # Fallback to random subset if singular
+                subset = np.sort(rng.choice(n_samples, size=p_params, replace=False))
+                ind = self._evaluate_candidate(subset, X_tilde, y, h)
+            if ind is not None:
+                population.append(ind)
 
-            candidate_residuals = _compute_residuals(X_tilde, y, candidate_beta)
-            candidate_crit, candidate_h_indices = self._compute_criterion(
-                candidate_residuals, h
-            )
+        # Ensure at least one individual is in population
+        if len(population) == 0:
+            subset = np.arange(p_params)
+            ind = self._evaluate_candidate(subset, X_tilde, y, h)
+            assert ind is not None
+            population.append(ind)
 
-            # Optional C-step refinement
-            if self.c_steps > 0:
-                for _ in range(self.c_steps):
-                    beta_c, residuals_c, crit_c, new_h_indices = self._c_step(
-                        X_tilde, y, candidate_h_indices, h
+        # Sort population by criterion ascending
+        population.sort(key=lambda ind: ind.crit)
+        best_ind = population[0]
+
+        # 2. (mu + lambda) Evolutionary Algorithm Loop
+        generations_without_improvement = 0
+        actual_iterations = 0
+
+        for iteration in range(1, self.max_iter + 1):
+            actual_iterations = iteration
+            offspring_list: list[_Individual] = []
+
+            for _ in range(self.n_offspring):
+                # Parent 1 via binary tournament
+                if len(population) > 1:
+                    t_idx = rng.choice(len(population), size=2, replace=False)
+                    p1 = population[min(t_idx[0], t_idx[1])]
+                else:
+                    p1 = population[0]
+
+                # Crossover
+                if len(population) > 1 and rng.uniform(0.0, 1.0) < self.crossover_rate:
+                    t_idx2 = rng.choice(len(population), size=2, replace=False)
+                    p2 = population[min(t_idx2[0], t_idx2[1])]
+                    child_subset = _crossover_subsets(
+                        p1.subset, p2.subset, p_params, n_samples, rng
                     )
-                    if crit_c <= candidate_crit:
-                        candidate_beta = beta_c
-                        candidate_residuals = residuals_c
-                        candidate_crit = crit_c
-                        candidate_h_indices = new_h_indices
+                else:
+                    child_subset = p1.subset.copy()
 
-            # Selection: (1+1) elitist update
-            if candidate_crit <= best_crit:
-                best_crit = candidate_crit
-                best_beta = candidate_beta.copy()
-                best_residuals = candidate_residuals.copy()
-                best_h_indices = candidate_h_indices.copy()
-                active_indices = candidate_indices.copy()
-                residuals = candidate_residuals
+                # Mutation
+                child_subset = _mutate_subset(
+                    child_subset, p1.residuals, p_params, n_samples, self.prob_move, rng
+                )
 
-        self.n_iter_ = self.max_iter
-        self._finalize(best_beta, best_residuals, best_crit, best_h_indices, n_samples, X_tilde, y)
+                # Evaluation
+                child_ind = self._evaluate_candidate(child_subset, X_tilde, y, h)
+                if child_ind is not None:
+                    offspring_list.append(child_ind)
+
+            # (mu + lambda) elitist selection
+            combined = population + offspring_list
+            combined.sort(key=lambda ind: ind.crit)
+            population = combined[: self.population_size]
+
+            # Check for improvement
+            if population[0].crit < best_ind.crit:
+                best_ind = population[0]
+                generations_without_improvement = 0
+            else:
+                generations_without_improvement += 1
+
+            if (
+                self.n_iter_no_change is not None
+                and generations_without_improvement >= self.n_iter_no_change
+            ):
+                break
+
+        self.n_iter_ = actual_iterations
+        self._finalize(
+            best_ind.beta,
+            best_ind.residuals,
+            best_ind.crit,
+            best_ind.h_indices,
+            n_samples,
+            X_tilde,
+            y,
+        )
         return self
 
     def _finalize(
@@ -313,7 +453,9 @@ class BaseEvolutionaryRobustRegressor(RegressorMixin, BaseEstimator, ABC):
                 inlier_candidates = np.where(np.abs(residuals) <= cutoff)[0]
                 if len(inlier_candidates) >= len(beta):
                     try:
-                        beta_rw = _solve_elemental_subset(X_tilde[inlier_candidates], y[inlier_candidates])
+                        beta_rw = _solve_elemental_subset(
+                            X_tilde[inlier_candidates], y[inlier_candidates]
+                        )
                         residuals_rw = _compute_residuals(X_tilde, y, beta_rw)
                         final_beta = beta_rw
                         final_residuals = residuals_rw
