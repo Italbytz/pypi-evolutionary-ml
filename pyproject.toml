@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evolutionary-ml"
+version = "0.1.0"
+description = "Scikit-learn compatible evolutionary machine learning toolkit: high-breakdown robust regression (LTS, LMS, LTA, LQD) and evolutionary estimators"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "EvolutionaryML contributors" }
+]
+keywords = [
+  "machine learning",
+  "evolutionary algorithms",
+  "robust statistics",
+  "robust regression",
+  "least trimmed squares",
+  "least median of squares",
+  "scikit-learn",
+  "scikit-learn-estimator"
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Topic :: Software Development :: Libraries :: Python Modules"
+]
+dependencies = [
+  "numpy>=1.23",
+  "scikit-learn>=1.2"
+]
+
+[project.urls]
+Homepage = "https://github.com/Italbytz/pypi-evolutionary-ml"
+Source = "https://github.com/Italbytz/pypi-evolutionary-ml"
+"Bug Tracker" = "https://github.com/Italbytz/pypi-evolutionary-ml/issues"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
